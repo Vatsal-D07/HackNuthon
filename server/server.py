@@ -1,110 +1,141 @@
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import cv2
 import numpy as np
-from pyzbar.pyzbar import decode
-import pytesseract
 import base64
-import io
-from PIL import Image
+from pyzbar.pyzbar import decode
+import csv
+from datetime import datetime
 
-app = Flask(__name__)
-CORS(app)  # Allow cross-origin requests
+app = FastAPI()
+
+# Allow CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-@app.route("/upload", methods=["POST"])
-def upload_image():
-    if "file" not in request.files:
-        return jsonify({"error": "No file part"}), 400
-    
-    file = request.files["file"]
-    filename = file.filename
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    file.save(file_path)
-    
-    # Process the image for barcode
-    result = process_barcode_image(file_path)
-    
-    return jsonify(result)
+# CSV file path for barcode tracking
+CSV_FILE = "barcode_data.csv"
 
-def process_barcode_image(image_path):
+# Initialize CSV file if it doesn't exist
+def init_csv():
+    if not os.path.exists(CSV_FILE):
+        with open(CSV_FILE, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Code", "Type", "Number", "LastScanned"])
+
+# Function to read existing barcode data
+def read_barcode_data():
+    barcode_counts = {}
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, mode='r', newline='') as file:
+            reader = csv.reader(file)
+            next(reader, None)  # Skip header
+            for row in reader:
+                if len(row) >= 3:
+                    barcode, barcode_type, count = row[0], row[1], row[2]
+                    last_scanned = row[3] if len(row) > 3 else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    barcode_counts[barcode] = (barcode_type, int(count), last_scanned)
+    return barcode_counts
+
+# Function to write barcode data to CSV
+def write_barcode_data(barcode_data):
+    with open(CSV_FILE, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Code", "Type", "Number", "LastScanned"])
+        for barcode, (barcode_type, count, last_scanned) in barcode_data.items():
+            writer.writerow([barcode, barcode_type, count, last_scanned])
+
+# Function to detect barcodes
+def detect_barcodes(image_path):
     # Read the image
-    image = cv2.imread(image_path)
+    img = cv2.imread(image_path)
+    if img is None:
+        raise ValueError(f"Could not read image at {image_path}")
     
-    if image is None:
-        return {"error": "Unable to load image"}
+    # Detect barcodes
+    detected_barcodes = decode(img)
     
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Read existing barcode data
+    barcode_data = read_barcode_data()
+    barcode_results = []
     
-    # Process image to enhance barcode detection
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    # Apply adaptive threshold
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 11, 2
-    )
-    
-    # Detect barcode
-    decoded_objects = decode(gray)
-    
-    barcode_info = []
-    
-    # Draw rectangles around barcodes
-    processed_img = image.copy()
-    
-    if decoded_objects:
-        for obj in decoded_objects:
-            barcode_data = obj.data.decode("utf-8")
-            barcode_type = obj.type
+    # Process detected barcodes
+    for barcode in detected_barcodes:
+        # Extract barcode info
+        barcode_text = barcode.data.decode('utf-8')
+        barcode_type = barcode.type
+        
+        # Draw rectangle around barcode
+        (x, y, w, h) = barcode.rect
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        
+        # Add text above barcode
+        cv2.putText(img, f"{barcode_text} ({barcode_type})", (x, y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Update barcode counts
+        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if barcode_text in barcode_data:
+            existing_type, count, _ = barcode_data[barcode_text]
+            barcode_data[barcode_text] = (existing_type, count + 1, current_time)
+        else:
+            barcode_data[barcode_text] = (barcode_type, 1, current_time)
             
-            # Get barcode coordinates
-            points = obj.polygon
-            if len(points) > 4:
-                hull = cv2.convexHull(np.array([point for point in points], dtype=np.float32))
-                hull = cv2.approxPolyDP(hull, 0.1 * cv2.arcLength(hull, True), True)
-                points = hull
-            
-            # Convert points to numpy array
-            pts = np.array([point for point in points], dtype=np.int32)
-            
-            # Draw polygon around the barcode
-            cv2.polylines(processed_img, [pts], True, (0, 255, 0), 3)
-            
-            # Put barcode data and type on the image
-            x = pts[0][0]
-            y = pts[0][1]
-            cv2.putText(processed_img, f"{barcode_type}: {barcode_data}", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            barcode_info.append({
-                "type": barcode_type,
-                "data": barcode_data
-            })
+        # Add to results
+        barcode_results.append({
+            "type": barcode_type,
+            "data": barcode_text
+        })
     
-    # Save the processed image
-    processed_img_path = image_path.replace('.jpg', '_processed.jpg')
-    cv2.imwrite(processed_img_path, processed_img)
+    # Write updated data
+    write_barcode_data(barcode_data)
     
-    # Convert processed image to base64 for frontend display
-    _, buffer = cv2.imencode('.jpg', processed_img)
-    img_str = base64.b64encode(buffer).decode('utf-8')
-    
-    result = {
-        "message": "Image processed successfully",
-        "original_path": image_path,
-        "processed_path": processed_img_path,
-        "processed_image": img_str,
-        "barcodes": barcode_info,
-        "found": len(barcode_info) > 0
-    }
-    
-    return result
+    return img, barcode_results
 
-if __name__ == "__main__":
-    app.run(debug=True)
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    try:
+        # Ensure CSV file exists
+        init_csv()
+        
+        # Create a unique filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{timestamp}_{file.filename}"
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        
+        # Save uploaded file
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        
+        # Process the image to detect barcodes
+        processed_img, barcode_results = detect_barcodes(file_path)
+        
+        # Convert processed image to base64
+        _, buffer = cv2.imencode('.jpg', processed_img)
+        img_str = base64.b64encode(buffer).decode('utf-8')
+        
+        return JSONResponse(content={
+            "message": "Image processed successfully",
+            "processed_image": img_str,
+            "barcodes": barcode_results,
+            "found": len(barcode_results) > 0
+        })
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if _name_ == "_main_":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)

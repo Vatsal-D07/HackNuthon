@@ -1,6 +1,6 @@
 # Virtual Environment
 venv/
-myenv/
+myvenv/
 env/
 __pycache__/
 *.pyc
