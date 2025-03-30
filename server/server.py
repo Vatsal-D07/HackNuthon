@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import base64
 from pyzbar.pyzbar import decode
-import csv
+import json
 from datetime import datetime
 
 app = FastAPI()
@@ -21,121 +21,107 @@ app.add_middleware(
 )
 
 UPLOAD_FOLDER = "uploads"
+JSON_FILE = "barcode_data.json"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# CSV file path for barcode tracking
-CSV_FILE = "barcode_data.csv"
+# Initialize JSON file if it doesn't exist
+def init_json():
+    if not os.path.exists(JSON_FILE):
+        with open(JSON_FILE, "w") as file:
+            json.dump({}, file)
 
-# Initialize CSV file if it doesn't exist
-def init_csv():
-    if not os.path.exists(CSV_FILE):
-        with open(CSV_FILE, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["Code", "Type", "Number", "LastScanned"])
-
-# Function to read existing barcode data
+# Read barcode data from JSON
 def read_barcode_data():
-    barcode_counts = {}
-    if os.path.exists(CSV_FILE):
-        with open(CSV_FILE, mode='r', newline='') as file:
-            reader = csv.reader(file)
-            next(reader, None)  # Skip header
-            for row in reader:
-                if len(row) >= 3:
-                    barcode, barcode_type, count = row[0], row[1], row[2]
-                    last_scanned = row[3] if len(row) > 3 else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    barcode_counts[barcode] = (barcode_type, int(count), last_scanned)
-    return barcode_counts
+    if os.path.exists(JSON_FILE):
+        with open(JSON_FILE, "r") as file:
+            try:
+                return json.load(file)
+            except json.JSONDecodeError:
+                return {}
+    return {}
 
-# Function to write barcode data to CSV
+# Write barcode data to JSON
 def write_barcode_data(barcode_data):
-    with open(CSV_FILE, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(["Code", "Type", "Number", "LastScanned"])
-        for barcode, (barcode_type, count, last_scanned) in barcode_data.items():
-            writer.writerow([barcode, barcode_type, count, last_scanned])
+    with open(JSON_FILE, "w") as file:
+        json.dump(barcode_data, file, indent=4)
 
-# Function to detect barcodes
+# Validate file type
+def is_valid_image(file: UploadFile):
+    allowed_types = {"image/png", "image/jpeg", "image/jpg"}
+    if file.content_type not in allowed_types:
+        return False
+    return True
+
+# Detect barcodes in an image
 def detect_barcodes(image_path):
-    # Read the image
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Could not read image at {image_path}")
-    
-    # Detect barcodes
+
     detected_barcodes = decode(img)
-    
-    # Read existing barcode data
     barcode_data = read_barcode_data()
     barcode_results = []
-    
-    # Process detected barcodes
+
     for barcode in detected_barcodes:
-        # Extract barcode info
         barcode_text = barcode.data.decode('utf-8')
         barcode_type = barcode.type
-        
-        # Draw rectangle around barcode
         (x, y, w, h) = barcode.rect
-        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-        
-        # Add text above barcode
-        cv2.putText(img, f"{barcode_text} ({barcode_type})", (x, y - 10), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-        # Update barcode counts
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 255, 0), 3)
+        cv2.putText(img, f"{barcode_text} ({barcode_type})", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if barcode_text in barcode_data:
-            existing_type, count, _ = barcode_data[barcode_text]
-            barcode_data[barcode_text] = (existing_type, count + 1, current_time)
+            barcode_data[barcode_text]["count"] += 1
+            barcode_data[barcode_text]["last_scanned"] = current_time
         else:
-            barcode_data[barcode_text] = (barcode_type, 1, current_time)
-            
-        # Add to results
-        barcode_results.append({
-            "type": barcode_type,
-            "data": barcode_text
-        })
-    
-    # Write updated data
+            barcode_data[barcode_text] = {"type": barcode_type, "count": 1, "last_scanned": current_time}
+
+        barcode_results.append({"type": barcode_type, "data": barcode_text})
+
     write_barcode_data(barcode_data)
-    
     return img, barcode_results
 
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     try:
-        # Ensure CSV file exists
-        init_csv()
-        
-        # Create a unique filename with timestamp
+        if not is_valid_image(file):
+            raise HTTPException(status_code=400, detail="Invalid file type. Only PNG, JPEG, and JPG are allowed.")
+
+        init_json()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{file.filename}"
         file_path = os.path.join(UPLOAD_FOLDER, filename)
-        
-        # Save uploaded file
+
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
-        
-        # Process the image to detect barcodes
+
         processed_img, barcode_results = detect_barcodes(file_path)
-        
-        # Convert processed image to base64
         _, buffer = cv2.imencode('.jpg', processed_img)
         img_str = base64.b64encode(buffer).decode('utf-8')
-        
+
         return JSONResponse(content={
             "message": "Image processed successfully",
             "processed_image": img_str,
             "barcodes": barcode_results,
             "found": len(barcode_results) > 0
         })
-        
+
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+
     except Exception as e:
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-if _name_ == "_main_":
+@app.get("/barcodes")
+def get_all_barcodes():
+    try:
+        barcode_data = read_barcode_data()
+        return JSONResponse(content={"barcodes": barcode_data})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
