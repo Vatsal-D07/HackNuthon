@@ -1,0 +1,26 @@
+# Virtual Environment
+venv/
+myenv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+logs/
+*.log
+debug.log
+nohup.out
+
+# Environment Variables
+.env
+.env.local
+config.json
+
+# Compiled & Cache Files
+*.pyc
+*.pyo
+*.pyd
+db.sqlite3
+migrations/
+instance/
